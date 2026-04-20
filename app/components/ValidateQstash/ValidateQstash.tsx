@@ -9,50 +9,122 @@ interface RequestResult {
   index: number;
   success: boolean;
   duration: number;
-  data?: { url: string; name: string; remainingCredits: number };
+  jobId?: string;
+  state?: "queued" | "done" | "failed" | "not_found";
+  data?: { url: string; name: string; status: number; remainingCredits: number };
   error?: string;
+}
+
+async function waitForResult(jobId: string) {
+  const MAX_TRIES = 90;
+  let tries = 0;
+
+  while (tries < MAX_TRIES) {
+    const res = await fetch(`/api/pdftoqrcode/status?jobId=${encodeURIComponent(jobId)}`);
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      if (res.status === 404) {
+        return { status: "not_found" as const, data };
+      }
+      return { status: "failed" as const, data: { message: data?.message || `HTTP ${res.status}` } };
+    }
+
+    if (data?.status === "done") {
+      return { status: "done" as const, data };
+    }
+
+    if (data?.status === "failed") {
+      return { status: "failed" as const, data };
+    }
+
+    await new Promise((r) => setTimeout(r, 1000));
+    tries++;
+  }
+
+  return { status: "failed" as const, data: { message: "Timeout waiting for job result" } };
 }
 
 async function sendBarcodeRequest(index: number): Promise<RequestResult> {
   const start = Date.now();
   try {
-    const res = await fetch('/api/pdftoqrcode', {
+    const res = await fetch("/api/pdftoqrcode", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        name: "qrcode.png",      // optional, defaults to "barcode.png"
-        type: "QRCode",       // required
-        value: PDF_URL,           // required
-        inline: false,            // optional, defaults to true
-        async: false,             // optional, defaults to false
-        // decorationImage: "https://example.com/logo.png"  // optional
+        name: "qrcode.png",
+        type: "QRCode",
+        value: PDF_URL,
+        inline: false,
+        async: false,
+        profiles: JSON.stringify({
+          Angle: 0,
+          NarrowBarWidth: 30,
+          ForeColor: "#000000",
+          BackColor: "#ffffff",
+        }),
       }),
     });
 
     const duration = Date.now() - start;
+    const json = await res.json().catch(() => ({}));
+
     if (!res.ok) {
-      const text = await res.text();
-      return { index, success: false, duration, error: `HTTP ${res.status}: ${text}` };
+      return {
+        index,
+        success: false,
+        duration,
+        state: "failed",
+        error: `HTTP ${res.status}: ${json?.message || "Unknown error"}`,
+      };
     }
-    console.log(res, "this is data")
-    const json = await res.json();
+
+    if (!json?.queued || !json?.jobId) {
+      return {
+        index,
+        success: false,
+        duration,
+        state: "failed",
+        error: `Invalid enqueue response: ${JSON.stringify(json)}`,
+      };
+    }
+
+    const jobId = json.jobId as string;
+    const polled = await waitForResult(jobId);
+
+    if (polled.status === "done" && polled.data?.data?.url) {
+      const doneData = polled.data.data;
+      return {
+        index,
+        success: true,
+        duration: Date.now() - start,
+        jobId,
+        state: "done",
+        data: {
+          url: doneData.url,
+          name: doneData.name || "qrcode.png",
+          status: doneData.status || 200,
+          remainingCredits: doneData.remainingCredits || 0,
+        },
+      };
+    }
+
     return {
       index,
-      success: true,
-      duration,
-      data: {
-        url: json.url ?? "",
-        name: json.name ?? "barcode.png",
-        remainingCredits: json.remainingCredits ?? 0,
-      },
+      success: false,
+      duration: Date.now() - start,
+      jobId,
+      state: polled.status,
+      error: polled.data?.message || "Job failed or not found",
     };
   } catch (e: unknown) {
     return {
       index,
       success: false,
       duration: Date.now() - start,
+      state: "failed",
       error: e instanceof Error ? e.message : String(e),
     };
   }
@@ -89,7 +161,7 @@ function runBatched(
 }
 
 export default function RateLimiterPage() {
-  const [totalRequests, setTotalRequests] = useState(15);
+  const [totalRequests, setTotalRequests] = useState(25);
   const [perSecond, setPerSecond] = useState(5);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<RequestResult[]>([]);
@@ -381,13 +453,17 @@ export default function RateLimiterPage() {
 
                   {r.success && r.data && (
                     <div style={{ marginTop: 6, color: "#334155", lineHeight: 1.7 }}>
+                      <div>
+                        <span style={{ color: "#1e2d40" }}>job </span>{r.jobId || "—"}
+                        <span style={{ color: "#1e2d40", marginLeft: 14 }}>state </span>{r.state || "done"}
+                      </div>
                       <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         <span style={{ color: "#1e2d40" }}>url </span>
                         <span style={{ color: "#3d8a5e" }}>{r.data.url || "—"}</span>
-                        <span style={{ color: "#3d8a5e" }}>{r.data.name}</span>
                       </div>
                       <div>
                         <span style={{ color: "#1e2d40" }}>name </span>{r.data.name}
+                        <span style={{ color: "#1e2d40", marginLeft: 14 }}>status </span>{r.data.status}
                         <span style={{ color: "#1e2d40", marginLeft: 14 }}>credits </span>{r.data.remainingCredits}
                       </div>
                     </div>
@@ -395,6 +471,9 @@ export default function RateLimiterPage() {
 
                   {!r.success && (
                     <div style={{ marginTop: 5, color: "#f87171", opacity: 0.75, lineHeight: 1.5 }}>
+                      <div style={{ marginBottom: 3 }}>
+                        job {r.jobId || "—"} · state {r.state || "failed"}
+                      </div>
                       {r.error}
                     </div>
                   )}
