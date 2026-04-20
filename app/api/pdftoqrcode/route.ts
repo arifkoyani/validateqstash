@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Client } from "@upstash/qstash";
+import { randomUUID } from "crypto";
+import { redis } from "@/lib/redis";
 
 const client = new Client({
   token: process.env.QSTASH_TOKEN!,
@@ -30,8 +32,13 @@ export async function POST(request: NextRequest) {
       inline = inlineRaw === "true" ? true : inlineRaw === "false" ? false : undefined;
       asyncFlag = asyncRaw === "true" ? true : asyncRaw === "false" ? false : undefined;
 
-      const decorationImageRaw = formData.get("decorationImage") as string;
-      if (decorationImageRaw) decorationImage = decorationImageRaw;
+      const decorationImageRaw = formData.get("decorationImage") ?? formData.get("decorationImageFile");
+      if (typeof decorationImageRaw === "string" && decorationImageRaw) {
+        decorationImage = decorationImageRaw;
+      } else if (decorationImageRaw instanceof File && decorationImageRaw.size > 0) {
+        const bytes = Buffer.from(await decorationImageRaw.arrayBuffer());
+        decorationImage = `data:${decorationImageRaw.type || "application/octet-stream"};base64,${bytes.toString("base64")}`;
+      }
     } else {
       const body = await request.json();
       name = body?.name;
@@ -51,11 +58,19 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: true, message: "Barcode type is required" }, { status: 400 });
     }
 
-    if (!process.env.CHOOSE_PDF_API_KEY && !process.env.NEXT_PUBLIC_CHOOSE_PDF_API_KEY) {
+    if (!process.env.CHOOSE_PDF_API_KEY) {
       return NextResponse.json({ error: true, message: "ChoosePDF API not configured" }, { status: 500 });
     }
 
+    const appBaseUrl = process.env.APP_BASE_URL;
+    if (!appBaseUrl) {
+      return NextResponse.json({ error: true, message: "APP_BASE_URL is not configured" }, { status: 500 });
+    }
+
+    const jobId = randomUUID();
+
     const job = {
+      jobId,
       name: name || "barcode.png",
       type,
       value,
@@ -72,8 +87,10 @@ export async function POST(request: NextRequest) {
       decorationImage,
     };
 
+    await redis.set(`job:${jobId}`, { status: "processing", jobId });
+
     const result = await client.publishJSON({
-      url: `${process.env.APP_BASE_URL}/api/pdftoqrcode/process`,
+      url: `${appBaseUrl.replace(/\/$/, "")}/api/pdftoqrcode/process`,
       body: job,
       retries: 3,
       flowControl: {
@@ -87,6 +104,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       error: false,
       queued: true,
+      jobId,
       messageId: result.messageId,
       message: "Request queued successfully",
     });
