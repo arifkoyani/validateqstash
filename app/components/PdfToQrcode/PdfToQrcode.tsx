@@ -433,6 +433,29 @@ export default function PdfToQrcode() {
 		})
 	}
 
+	const waitForResult = async (jobId: string) => {
+		const MAX_TRIES = 60
+		let tries = 0
+
+		while (tries < MAX_TRIES) {
+			const res = await fetch(`/api/pdftoqrcode/status?jobId=${jobId}`)
+			const data = await res.json()
+
+			if (data?.status === "done") {
+				return data
+			}
+
+			if (data?.status === "failed") {
+				throw new Error("Processing failed")
+			}
+
+			await new Promise((resolve) => setTimeout(resolve, 1000))
+			tries++
+		}
+
+		throw new Error("Timeout waiting for result")
+	}
+
 	const generateBarcode = async () => {
 		if (!pdfUrl) {
 			setError({ message: "Please upload a PDF file first", type: "validation" })
@@ -504,11 +527,21 @@ export default function PdfToQrcode() {
 
 			const data = await response.json()
 
-			if (data?.error === false && data?.url) {
-				setBarcodeUrl(data.url)
-				setError(null)
+			if (data?.queued && data?.jobId) {
+				try {
+					const result = await waitForResult(data.jobId)
+
+					if (result?.data?.url) {
+						setBarcodeUrl(result.data.url)
+						setError(null)
+					} else {
+						setError({ message: "QR generation failed", type: "api" })
+					}
+				} catch {
+					setError({ message: "Timeout or failed to fetch result", type: "timeout" })
+				}
 			} else {
-				const errorMessage = data?.message || "Barcode generation failed. Please try again."
+				const errorMessage = data?.message || "Barcode generation failed"
 				setError({ message: errorMessage, type: "api" })
 			}
 		} catch (err) {
